@@ -20,6 +20,7 @@
 #include <pwd.h>
 #include <time.h>
 #include <limits.h>
+#include <pthread.h>
 #include "md5.h"
 #include "osp2p.h"
 
@@ -73,6 +74,16 @@ typedef struct task {
 				// task_pop_peer() removes peers from it, one
 				// at a time, if a peer misbehaves.
 } task_t;
+
+struct arg_struct {
+	int argc;
+	char **argv;
+	struct in_addr listen_addr;
+	struct in_addr listen_addr2;
+	int listen_port;
+	int listen_port2;
+	task_t* tracker_task;
+};
 
 
 // task_new(type)
@@ -321,7 +332,7 @@ static size_t read_tracker_response(task_t *t)
 //	Opens a connection to the tracker at address 'addr' and port 'port'.
 //	Quits if there's no tracker at that address and/or port.
 //	Returns the task representing the tracker.
-task_t *start_tracker(struct in_addr addr, int port)
+task_t *start_tracker(struct in_addr addr, int port, struct in_addr *listen_addr)
 {
 	struct sockaddr_in saddr;
 	socklen_t saddrlen;
@@ -338,7 +349,7 @@ task_t *start_tracker(struct in_addr addr, int port)
 		error("getsockname: %s\n", strerror(errno));
 	else {
 		assert(saddr.sin_family == AF_INET);
-		listen_addr = saddr.sin_addr;
+		*listen_addr = saddr.sin_addr;
 	}
 
 	// Collect the tracker's greeting.
@@ -352,7 +363,7 @@ task_t *start_tracker(struct in_addr addr, int port)
 // start_listen()
 //	Opens a socket to listen for connections from other peers who want to
 //	upload from us.  Returns the listening task.
-task_t *start_listen(void)
+task_t *start_listen(int *listen_port)
 {
 	struct in_addr addr;
 	task_t *t;
@@ -362,8 +373,8 @@ task_t *start_listen(void)
 	// Set up the socket to accept any connection.  The port here is
 	// ephemeral (we can use any port number), so start at port
 	// 11112 and increment until we can successfully open a port.
-	for (listen_port = 11112; listen_port < 13000; listen_port++)
-		if ((fd = open_socket(addr, listen_port)) != -1)
+	for (*listen_port = 11112; *listen_port < 13000; (*listen_port)++)
+		if ((fd = open_socket(addr, *listen_port)) != -1)
 			goto bound;
 		else if (errno != EADDRINUSE)
 			die("cannot make listen socket");
@@ -373,7 +384,7 @@ task_t *start_listen(void)
 	die("Tried ~200 ports without finding an open port, giving up.\n");
 
     bound:
-	message("* Listening on port %d\n", listen_port);
+	message("* Listening on port %d\n", *listen_port);
 
 	t = task_new(TASK_PEER_LISTEN);
 	t->peer_fd = fd;
@@ -385,7 +396,7 @@ task_t *start_listen(void)
 //	Registers this peer with the tracker, using 'myalias' as this peer's
 //	alias.  Also register all files in the current directory, allowing
 //	other peers to upload those files from us.
-static void register_files(task_t *tracker_task, const char *myalias)
+static void register_files(task_t *tracker_task, const char *myalias, struct in_addr listen_addr, int listen_port)
 {
 	DIR *dir;
 	struct dirent *ent;
@@ -500,7 +511,7 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 //	directory.  't' was created by start_download().
 //	Starts with the first peer on 't's peer list, then tries all peers
 //	until a download is successful.
-static void task_download(task_t *t, task_t *tracker_task)
+static void task_download(task_t *t, task_t *tracker_task, struct in_addr listen_addr, int listen_port, struct in_addr listen_addr2, int listen_port2)
 {
 	int i, ret = -1;
 	assert((!t || t->type == TASK_DOWNLOAD)
@@ -512,8 +523,10 @@ static void task_download(task_t *t, task_t *tracker_task)
 		      (t ? t->filename : "that file"));
 		task_free(t);
 		return;
-	} else if (t->peer_list->addr.s_addr == listen_addr.s_addr
-		   && t->peer_list->port == listen_port)
+	} else if ((t->peer_list->addr.s_addr == listen_addr.s_addr
+		   	&& t->peer_list->port == listen_port) 
+			|| (t->peer_list->addr.s_addr == listen_addr2.s_addr
+		   	&& t->peer_list->port == listen_port2))
 		goto try_again;
 
 	// Connect to the peer and write the GET command
@@ -592,7 +605,7 @@ static void task_download(task_t *t, task_t *tracker_task)
 		unlink(t->disk_filename);
 	// recursive call
 	task_pop_peer(t);
-	task_download(t, tracker_task);
+	task_download(t, tracker_task, listen_addr, listen_port, listen_addr2, listen_port2);
 }
 
 
@@ -679,16 +692,37 @@ static void task_upload(task_t *t)
 	task_free(t);
 }
 
+void *oddDownloadPth(void *arg){
+	task_t *t;
+	struct arg_struct *args = (struct arg_struct*)arg;
+	for (; args->argc > 1; args->argc -= 2, args->argv += 2)
+		if ((t = start_download(args->tracker_task, args->argv[1])))
+			task_download(t, args->tracker_task, args->listen_addr, args->listen_port, args->listen_addr2, args->listen_port2);
+	return NULL;
+}
+
+void *updatePth(void *arg){
+	task_t *t;
+	task_t *listen_task = (task_t *) arg;
+	while ((t = task_listen(listen_task)))
+		task_upload(t);
+
+	return NULL;
+}
+
 
 // main(argc, argv)
 //	The main loop!
 int main(int argc, char *argv[])
 {
-	task_t *tracker_task, *listen_task, *t;
+	task_t *tracker_task, *tracker_task2, *listen_task, *listen_task2, *t;
 	struct in_addr tracker_addr;
+	struct in_addr listen_addr, listen_addr2;
+	int listen_port, listen_port2;
 	int tracker_port;
 	char *s;
 	const char *myalias;
+	const char *myalias2;
 	struct passwd *pwent;
 
 	// Default tracker is read.cs.ucla.edu
@@ -698,9 +732,14 @@ int main(int argc, char *argv[])
 		myalias = (const char *) malloc(strlen(pwent->pw_name) + 20);
 		sprintf((char *) myalias, "%s%d", pwent->pw_name,
 			(int) time(NULL));
+		myalias2 = (const char *) malloc(strlen(pwent->pw_name) + 20);
+		sprintf((char *) myalias2, "%s%d", pwent->pw_name,
+			(int) (time(NULL) + 1));
 	} else {
 		myalias = (const char *) malloc(40);
 		sprintf((char *) myalias, "osppeer%d", (int) getpid());
+		myalias2 = (const char *) malloc(40);
+		sprintf((char *) myalias2, "osppeer%d", (int) (getpid() + 1));
 	}
 
 	// Ignore broken-pipe signals: if a connection dies, server should not
@@ -754,18 +793,47 @@ int main(int argc, char *argv[])
 	}
 
 	// Connect to the tracker and register our files.
-	tracker_task = start_tracker(tracker_addr, tracker_port);
-	listen_task = start_listen();
-	register_files(tracker_task, myalias);
+	tracker_task = start_tracker(tracker_addr, tracker_port, &listen_addr);
+	listen_task = start_listen(&listen_port);
+	register_files(tracker_task, myalias, listen_addr, listen_port);
+
+	//connect through another socket for multithreading
+	pthread_t oddPth;
+	struct arg_struct args;
+	args.argc = argc - 1;
+	args.argv = argv + 1;
+	tracker_task2 = start_tracker(tracker_addr, tracker_port, &listen_addr2);
+	listen_task2 = start_listen(&listen_port2);
+	register_files(tracker_task2, myalias2, listen_addr2, listen_port2);
+	printf("1111111\n");
+	args.listen_addr = listen_addr;
+	args.listen_port = listen_port;
+	args.listen_addr2 = listen_addr2;
+	args.listen_port2 = listen_port2;
+	args.tracker_task = tracker_task2;
 
 	// First, download files named on command line.
-	for (; argc > 1; argc--, argv++)
-		if ((t = start_download(tracker_task, argv[1])))
-			task_download(t, tracker_task);
+
+	if(pthread_create(&oddPth, NULL, &oddDownloadPth, &args) != 0){
+		//if thread isn't created successfully.
+		for (; argc > 1; argc--, argv++)
+			if ((t = start_download(tracker_task, argv[1])))
+				task_download(t, tracker_task, listen_addr, listen_port, listen_addr2, listen_port2);
+	}
+	else{
+		for (; argc > 1; argc -= 2, argv += 2)
+			if ((t = start_download(tracker_task, argv[1])))
+				task_download(t, tracker_task, listen_addr, listen_port, listen_addr2, listen_port2);
+	}
+	pthread_join(oddPth, NULL);
 
 	// Then accept connections from other peers and upload files to them!
+	pthread_t secondUpdatePth;
+	pthread_create(&secondUpdatePth, NULL, &updatePth, listen_task2);
+
 	while ((t = task_listen(listen_task)))
 		task_upload(t);
 
+	pthread_join(secondUpdatePth, NULL);
 	return 0;
 }
