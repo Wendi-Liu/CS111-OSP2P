@@ -26,8 +26,6 @@
 
 int evil_mode;			// nonzero iff this peer should behave badly
 
-static struct in_addr listen_addr;	// Define listening endpoint
-static int listen_port;
 
 
 /*****************************************************************************
@@ -38,6 +36,10 @@ static int listen_port;
 
 #define TASKBUFSIZ	4096	// Size of task_t::buf
 #define FILENAMESIZ	256	// Size of task_t::filename
+
+ struct in_addr prevAddr;
+ char prevFilename[FILENAMESIZ];
+ int sameAddr = 0;
 
 typedef enum tasktype {		// Which type of connection is this?
 	TASK_TRACKER,		// => Tracker connection
@@ -488,8 +490,9 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 		error("* Error while allocating task");
 		goto exit;
 	}
-	strcpy(t->filename, filename);
 
+	strncpy(t->filename, filename, FILENAMESIZ);
+	t->filename[FILENAMESIZ - 4] = '\0';
 	// add peers
 	s1 = tracker_task->buf;
 	while ((s2 = memchr(s1, '\n', (tracker_task->buf + messagepos) - s1))) {
@@ -641,6 +644,11 @@ static task_t *task_listen(task_t *listen_task)
 
 	message("* Got connection from %s:%d\n",
 		inet_ntoa(peer_addr.sin_addr), ntohs(peer_addr.sin_port));
+	if(peer_addr.sin_addr == prevAddr)
+		sameAddr = 1;
+	else
+		sameAddr = 0;
+	prevAddr = peer_addr.sin_addr;
 
 	t = task_new(TASK_UPLOAD);
 	t->peer_fd = fd;
@@ -656,6 +664,7 @@ static void task_upload(task_t *t)
 {
 	assert(t->type == TASK_UPLOAD);
 	// First, read the request from the peer.
+	int repeat = 0;
 	while (1) {
 		int ret = read_to_taskbuf(t->peer_fd, t);
 		if (ret == TBUF_ERROR) {
@@ -664,6 +673,17 @@ static void task_upload(task_t *t)
 		} else if (ret == TBUF_END
 			   || (t->tail && t->buf[t->tail-1] == '\n'))
 			break;
+		else if(ret == TBUF_AGAIN){
+			if(repeat >= 10){
+				error("* No data from connection");
+				goto exit;
+			}
+			else{
+				repeat++;
+				usleep(1);
+			}
+		}
+		repeat = 0;
 	}
 
 	assert(t->head == 0);
@@ -671,6 +691,11 @@ static void task_upload(task_t *t)
 		error("* Odd request %.*s\n", t->tail, t->buf);
 		goto exit;
 	}
+	if(sameAddr && strcmp(t->filename == prevFilename) == 0){
+		error("* Repeative download of same file from same address");
+		goto exit;
+	}
+
 	t->head = t->tail = 0;
 
 	t->disk_fd = open(t->filename, O_RDONLY);
@@ -681,12 +706,24 @@ static void task_upload(task_t *t)
 
 	message("* Transferring file %s\n", t->filename);
 	// Now, read file from disk and write it to the requesting peer.
+	repeat = 0;
 	while (1) {
 		int ret = write_from_taskbuf(t->peer_fd, t);
 		if (ret == TBUF_ERROR) {
 			error("* Peer write error");
 			goto exit;
 		}
+		else if(ret == TBUF_AGAIN){
+			if(repeat >= 10){
+				error("* No data from connection");
+				goto exit;
+			}
+			else{
+				repeat++;
+				usleep(1);
+			}
+		}
+		repeat = 0;
 
 		ret = read_to_taskbuf(t->disk_fd, t);
 		if (ret == TBUF_ERROR) {
@@ -773,13 +810,13 @@ int main(int argc, char *argv[])
 		--argc, ++argv;
 		goto argprocess;
 	} else if (argc >= 3 && strcmp(argv[1], "-d") == 0) {
-		if (chdir(argv[2]) == -1)
-			die("chdir");
+		if (chroot(argv[2]) == -1)
+			die("chroot");
 		argc -= 2, argv += 2;
 		goto argprocess;
 	} else if (argc >= 2 && argv[1][0] == '-' && argv[1][1] == 'd') {
-		if (chdir(argv[1]+2) == -1)
-			die("chdir");
+		if (chroot(argv[1]+2) == -1)
+			die("chroot");
 		--argc, ++argv;
 		goto argprocess;
 	} else if (argc >= 3 && strcmp(argv[1], "-b") == 0
