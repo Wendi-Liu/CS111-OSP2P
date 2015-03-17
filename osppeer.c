@@ -239,6 +239,7 @@ int open_socket(struct in_addr addr, int port)
 
 	if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == -1
 	    || fcntl(fd, F_SETFD, FD_CLOEXEC) == -1
+	    || fcntl(fd, F_SETFL, O_NONBLOCK) == -1
 	    || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1)
 		goto error;
 
@@ -568,6 +569,7 @@ static void task_download(task_t *t, task_t *tracker_task, struct in_addr listen
 
 	// Read the file into the task buffer from the peer,
 	// and write it from the task buffer onto disk.
+	int repeat = 0;
 	while (1) {
 		int ret = read_to_taskbuf(t->peer_fd, t);
 		if (ret == TBUF_ERROR) {
@@ -576,7 +578,16 @@ static void task_download(task_t *t, task_t *tracker_task, struct in_addr listen
 		} else if (ret == TBUF_END && t->head == t->tail)
 			/* End of file */
 			break;
-
+		else if(ret == TBUF_AGAIN){
+			if(repeat >= 10)
+				goto try_again;
+			else{
+				repeat++;
+				usleep(1);
+				continue;
+			}
+		}
+		repeat = 0;
 		ret = write_from_taskbuf(t->disk_fd, t);
 		if (ret == TBUF_ERROR) {
 			error("* Disk write error");
@@ -726,7 +737,7 @@ int main(int argc, char *argv[])
 	struct passwd *pwent;
 
 	// Default tracker is read.cs.ucla.edu
-	osp2p_sscanf("131.179.80.139:11111", "%I:%d",
+	osp2p_sscanf("164.67.100.231:12997", "%I:%d",
 		     &tracker_addr, &tracker_port);
 	if ((pwent = getpwuid(getuid()))) {
 		myalias = (const char *) malloc(strlen(pwent->pw_name) + 20);
